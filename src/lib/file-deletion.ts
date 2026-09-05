@@ -49,13 +49,16 @@ export interface DeletionMetrics {
   verifiedFiles: number; verifiedBytes: number; deleteCalls: number;
   peakChecks: number; peakDeletes: number; peakInputBytes: number;
   workerHashFiles?: number; mainHashFiles?: number; hashComputeMs?: number;
+  byteComparedFiles?: number; byteCompareMs?: number;
 }
 export interface DeletionOptions {
   groupConcurrency?: number;
   verificationConcurrency?: number;
   maxInputBytes?: number;
-  /** Diagnostic baseline only; both modes always hash the complete fresh file. */
+  /** Diagnostic baseline only; both modes always verify the complete fresh file. */
   hashExecution?: 'auto' | 'main';
+  /** Synthetic comparison baseline; not a user-facing safety bypass. */
+  exactVerification?: 'bytes' | 'hash';
   onMetrics?: (metrics: DeletionMetrics) => void;
 }
 export interface DeletionPlan {
@@ -130,10 +133,11 @@ function verificationLimiter(concurrency: number, budget: number) {
 type TimedStage = 'permissionMs' | 'metadataMs' | 'readMs' | 'hashMs' | 'deleteMs';
 type Measure = <T>(stage: TimedStage, work: () => Promise<T>) => Promise<T>;
 class DeletionStopped extends Error {}
+class KeeperVerificationFailed extends Error {}
 
-async function verifiedParent(
+async function freshTarget(
   access: LiveDirectoryAccess, file: ISimilarFileEntry, measure: Measure,
-  checkRunning: () => void, metrics: DeletionMetrics, hasher: HashService,
+  checkRunning: () => void,
 ) {
   const target = access.targets.get(file.id);
   if (!target) throw new Error('原文件授权失效，请重新扫描。');
@@ -159,6 +163,14 @@ async function verifiedParent(
     }
     return { parent, fresh };
   });
+  return { parent, fresh, target };
+}
+
+async function verifiedParent(
+  access: LiveDirectoryAccess, file: ISimilarFileEntry, measure: Measure,
+  checkRunning: () => void, metrics: DeletionMetrics, hasher: HashService,
+) {
+  const { parent, fresh, target } = await freshTarget(access, file, measure, checkRunning);
   const buffer = await measure('readMs', () => fresh.arrayBuffer());
   checkRunning();
   const digest = await measure('hashMs', () => hasher.digest(buffer));
@@ -210,7 +222,7 @@ export async function executeDeletion(
     elapsedMs: 0, authorizationMs: 0, permissionMs: 0, metadataMs: 0, readMs: 0,
     hashMs: 0, deleteMs: 0, verifiedFiles: 0, verifiedBytes: 0, deleteCalls: 0,
     peakChecks: 0, peakDeletes: 0, peakInputBytes: 0,
-    workerHashFiles: 0, mainHashFiles: 0, hashComputeMs: 0,
+    workerHashFiles: 0, mainHashFiles: 0, hashComputeMs: 0, byteComparedFiles: 0, byteCompareMs: 0,
   };
   const results = new Map<string, DeletionItemResult>();
   let activeChecks = 0, activeDeletes = 0, inputBytes = 0;
@@ -225,18 +237,57 @@ export async function executeDeletion(
     completed: results.size, total: plan.files.length, currentFile, phase,
     activeChecks, activeDeletes, verifiedBytes: metrics.verifiedBytes, elapsedMs: performance.now() - started,
   });
-  const verify = (file: ISimilarFileEntry) => limit(access.targets.get(file.id)?.size ?? 0, async () => {
+  const verificationJob = <T>(file: ISimilarFileEntry, size: number, work: () => Promise<T>) => limit(size, async () => {
     checkRunning();
-    const size = access.targets.get(file.id)?.size ?? 0;
     activeChecks += 1; inputBytes += size;
     metrics.peakChecks = Math.max(metrics.peakChecks, activeChecks);
     metrics.peakInputBytes = Math.max(metrics.peakInputBytes, inputBytes);
     try {
       report(file.relativePath);
-      return await verifiedParent(access, file, measure, checkRunning, metrics, hasher);
+      return await work();
     } catch (error) { if (denied(error)) stop = true; throw error; }
     finally { activeChecks -= 1; inputBytes -= size; report(file.relativePath); }
   });
+  const verify = (file: ISimilarFileEntry) => verificationJob(file, access.targets.get(file.id)?.size ?? 0,
+    () => verifiedParent(access, file, measure, checkRunning, metrics, hasher));
+  const verifyPair = (keeper: ISimilarFileEntry, file: ISimilarFileEntry) => verificationJob(file,
+    (access.targets.get(keeper.id)?.size ?? 0) + (access.targets.get(file.id)?.size ?? 0), async () => {
+      // Both buffers share one reservation. Never hold one while waiting to reserve
+      // the other (deadlock), or reuse either buffer for the next removal.
+      const settlePair = async <T>(work: (entry: ISimilarFileEntry) => Promise<T>): Promise<[T, T]> => {
+        const settled = await Promise.allSettled([keeper, file].map(async entry => {
+          try { return await work(entry); }
+          catch (error) { if (denied(error)) stop = true; throw error; }
+        }));
+        const [kept, copy] = settled;
+        if (kept.status === 'rejected') {
+          if (kept.reason instanceof DeletionStopped) throw kept.reason;
+          throw new KeeperVerificationFailed(failureMessage(kept.reason));
+        }
+        if (copy.status === 'rejected') throw copy.reason;
+        checkRunning();
+        return [kept.value, copy.value];
+      };
+      const [kept, copy] = await settlePair(entry => freshTarget(access, entry, measure, checkRunning));
+      const [keeperBytes, copyBytes] = await settlePair(entry => measure('readMs', () =>
+        (entry === keeper ? kept : copy).fresh.arrayBuffer()));
+      const result = await measure('hashMs', () => hasher.compareExact!(keeperBytes, copyBytes));
+      checkRunning();
+      metrics.hashComputeMs! += result.computeMs;
+      metrics.byteCompareMs! += result.compareMs;
+      if (result.backend === 'worker') metrics.workerHashFiles! += 1;
+      else metrics.mainHashFiles! += 1;
+      if (result.hex !== kept.target.fingerprint) {
+        throw new KeeperVerificationFailed('文件内容或修改时间已变化，未删除；请重新扫描。');
+      }
+      metrics.verifiedFiles += 1; metrics.verifiedBytes += kept.fresh.size;
+      if (!result.equal || copy.target.fingerprint !== kept.target.fingerprint) {
+        throw new Error('副本内容与保留项不再完全一致，未删除；请重新扫描。');
+      }
+      metrics.verifiedFiles += 1; metrics.verifiedBytes += copy.fresh.size;
+      metrics.byteComparedFiles! += 1;
+      return copy.parent;
+    });
   async function processGroup(group: DeletionPlan['groups'][number]) {
     let groupError: string | null = null;
     for (const file of group.selected) {
@@ -257,13 +308,24 @@ export async function executeDeletion(
           }
           checkRunning();
           // Settle every started check before deleting, reporting an error or leaving.
-          const checks = await Promise.allSettled([...group.retained, file].map(verify));
+          const anchor = group.retained[0];
+          // Large pairs retain the previous single-file hashing path so one large
+          // file cannot force two oversized inputs into memory together.
+          const usePair = group.level === 'exact' && options.exactVerification !== 'hash' && hasher.compareExact
+            && anchor.size + file.size <= budget;
+          const checks = await Promise.allSettled(usePair
+            ? [...group.retained.slice(1).map(verify), verifyPair(anchor, file)]
+            : [...group.retained, file].map(verify));
           const keeperFailure = checks.slice(0, -1).find((check) => check.status === 'rejected');
           if (keeperFailure?.status === 'rejected' && !(keeperFailure.reason instanceof DeletionStopped)) {
             groupError = `保留项核验失败：${failureMessage(keeperFailure.reason)}`;
             throw new Error(groupError);
           }
           const targetCheck = checks[checks.length - 1];
+          if (targetCheck.status === 'rejected' && targetCheck.reason instanceof KeeperVerificationFailed) {
+            groupError = `保留项核验失败：${targetCheck.reason.message}`;
+            throw new Error(groupError);
+          }
           if (targetCheck.status === 'rejected' && !(targetCheck.reason instanceof DeletionStopped)) throw targetCheck.reason;
           checkRunning();
           if (keeperFailure || targetCheck.status !== 'fulfilled') throw new DeletionStopped();

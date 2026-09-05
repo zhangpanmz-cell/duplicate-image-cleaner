@@ -28,15 +28,16 @@ async function run(factory: () => Promise<HashService> | HashService, label: str
     log(`${label}: ${seconds.toFixed(3)} 秒; ${completed} 次完整 SHA-256; 768 MiB; 工作线程 ${workerJobs} 次; 计算调用累计 ${(computeMs / 1000).toFixed(3)} 秒; 最大 UI 计时间隔 ${maxGap.toFixed(0)} ms`);
   } finally { clearInterval(clock); service.dispose(); }
 }
-async function pipeline(hashExecution: 'main' | 'auto') {
-  const f = await deletionFixture({ groupCount: 13, selectedCount: 18, bytes: 6 * 1024 * 1024 });
+async function pipeline(hashExecution: 'main' | 'auto', exactVerification: 'hash' | 'bytes') {
+  const f = await deletionFixture({ groupCount: 13, selectedCount: 15, bytes: 6 * 1024 * 1024 });
   const plan = makeDeletionPlan(f.groups, f.groups.map(g => g.id),
     f.groups.flatMap(g => g.files.filter(f => f.selected).map(f => f.id)), f.access);
   let metrics: DeletionMetrics | undefined;
   const result = await executeDeletion(f.access, plan, { cancelled: false }, undefined,
-    { hashExecution, onMetrics: value => { metrics = value; } });
-  if (result.some(r => r.status !== 'deleted') || f.files.size !== 13 || metrics?.verifiedFiles !== 468) throw new Error('流程校验失败');
-  log(`完整流程 ${hashExecution}: ${(metrics.elapsedMs / 1000).toFixed(3)} 秒; 234 项内存模拟删除/13 组; ${metrics.verifiedFiles} 次完整校验; ${metrics.verifiedBytes / 1024 / 1024} MiB; 工作线程 ${metrics.workerHashFiles} 次; 主线程 ${metrics.mainHashFiles} 次`);
+    { hashExecution, exactVerification, onMetrics: value => { metrics = value; } });
+  if (result.some(r => r.status !== 'deleted') || f.files.size !== 13 || metrics?.verifiedFiles !== 390
+    || metrics.byteComparedFiles !== (exactVerification === 'bytes' ? 195 : 0)) throw new Error('流程校验失败');
+  log(`完整流程 ${hashExecution}/${exactVerification}: ${(metrics.elapsedMs / 1000).toFixed(3)} 秒; 195 项内存模拟删除/13 组; ${metrics.verifiedFiles} 次完整校验; ${metrics.verifiedBytes / 1024 / 1024} MiB; SHA ${metrics.workerHashFiles! + metrics.mainHashFiles!} 次; 字节比较 ${metrics.byteComparedFiles} 次; 输入峰值 ${metrics.peakInputBytes / 1024 / 1024} MiB; 指纹累计 ${(metrics.hashComputeMs! / 1000).toFixed(3)} 秒; 比较累计 ${(metrics.byteCompareMs! / 1000).toFixed(3)} 秒`);
 }
 button.onclick = async () => {
   button.disabled = true; output.textContent = '';
@@ -47,8 +48,11 @@ button.onclick = async () => {
       [nativeHashService, '主线程 1'], [createBrowserHashService, '工作线程 1'],
       [createBrowserHashService, '工作线程 2'], [nativeHashService, '主线程 2'],
     ] as const) await run(factory, label);
-    await pipeline('main'); await pipeline('auto');
-    await pipeline('auto'); await pipeline('main');
+    for (let round = 0; round < 3; round++) {
+      await pipeline('auto', 'hash'); await pipeline('auto', 'bytes');
+      await pipeline('auto', 'bytes'); await pipeline('auto', 'hash');
+    }
+    await pipeline('main', 'hash'); await pipeline('main', 'bytes');
     log('测试通过：所有完整内容指纹一致。');
   } catch (error) { log(`失败：${String(error)}`); }
   finally { button.disabled = false; }

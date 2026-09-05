@@ -1,26 +1,31 @@
 /** A task-local computation pool, not a fingerprint cache. No filesystem handles
  * or paths leave the caller; transferred buffers are freshly read on every check. */
+import { equalBytes } from './exact-bytes.ts';
+
 export interface HashResult {
   hex: string;
   computeMs: number;
   backend: 'worker' | 'main';
 }
+export interface ExactResult extends HashResult { equal: boolean; compareMs: number }
 export interface HashService {
   digest(buffer: ArrayBuffer): Promise<HashResult>;
+  /** Hash the fresh keeper AND compare every byte of the fresh copy. */
+  compareExact?(keeper: ArrayBuffer, copy: ArrayBuffer): Promise<ExactResult>;
   dispose(): void;
 }
 export interface HashWorkerPort {
   onmessage: ((event: { data: unknown }) => void) | null;
   onerror: ((event: { preventDefault(): void }) => void) | null;
   onmessageerror: ((event: MessageEvent) => void) | null;
-  postMessage(message: { id: number; buffer: ArrayBuffer }, transfer: ArrayBuffer[]): void;
+  postMessage(message: { id: number; buffer: ArrayBuffer; copy?: ArrayBuffer }, transfer: ArrayBuffer[]): void;
   terminate(): void;
 }
 export const EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 
 export function nativeHashService(): HashService {
   let closed = false;
-  return {
+  const service: HashService = {
     async digest(buffer) {
       if (closed) throw new Error('内容校验已结束，请重新扫描。');
       const start = performance.now();
@@ -28,8 +33,17 @@ export function nativeHashService(): HashService {
       return { hex: Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join(''),
         computeMs: performance.now() - start, backend: 'main' };
     },
+    async compareExact(keeper, copy) {
+      if (closed) throw new Error('内容校验已结束，请重新扫描。');
+      // Do not approve even identical changed files without checking the keeper hash.
+      const digest = await service.digest(keeper);
+      const start = performance.now();
+      const equal = equalBytes(keeper, copy);
+      return { ...digest, equal, compareMs: performance.now() - start };
+    },
     dispose() { closed = true; },
   };
+  return service;
 }
 
 /** Worker startup failure (e.g. CSP) falls back before transferring ANY data.
@@ -38,8 +52,9 @@ export function nativeHashService(): HashService {
 export async function createHashPool(
   factory: () => HashWorkerPort, count = 4, startupMs = 2000, jobTimeoutMs = 120_000,
 ): Promise<HashService> {
-  type Job = { id: number; buffer: ArrayBuffer; resolve: (result: HashResult) => void; reject: (error: Error) => void };
-  type Slot = { port: HashWorkerPort; job?: Job; timer?: ReturnType<typeof setTimeout> };
+  type Job = { id: number; buffer: ArrayBuffer; copy?: ArrayBuffer;
+    resolve: (result: ExactResult) => void; reject: (error: Error) => void };
+  type Slot = { port: HashWorkerPort; job?: Job; exact?: boolean; timer?: ReturnType<typeof setTimeout> };
   const slots: Slot[] = [];
   const queue: Job[] = [];
   let failure: Error | undefined;
@@ -64,7 +79,8 @@ export async function createHashPool(
       const job = queue.shift()!;
       slot.job = job;
       slot.timer = setTimeout(() => close(), jobTimeoutMs);
-      try { slot.port.postMessage({ id: job.id, buffer: job.buffer }, [job.buffer]); }
+      try { slot.port.postMessage({ id: job.id, buffer: job.buffer, ...(job.copy ? { copy: job.copy } : {}) },
+        job.copy ? [job.buffer, job.copy] : [job.buffer]); }
       catch { close(); return; }
     }
   }
@@ -78,8 +94,9 @@ export async function createHashPool(
       slot.port.onerror = event => { event.preventDefault(); failed(); };
       slot.port.onmessageerror = failed;
       slot.port.onmessage = ({ data }) => {
-        const message = data as { type?: unknown; hex?: unknown } | null;
+        const message = data as { type?: unknown; hex?: unknown; exact?: unknown } | null;
         if (message?.type !== 'ready' || message.hex !== EMPTY_SHA256) { failed(); return; }
+        slot.exact = message.exact === true;
         clearTimeout(slot.timer); pendingStartup.delete(failed); resolve();
       };
     })));
@@ -91,23 +108,28 @@ export async function createHashPool(
     slot.port.onerror = event => { event.preventDefault(); close(); };
     slot.port.onmessageerror = () => close();
     slot.port.onmessage = ({ data }) => {
-      const message = data as { id?: unknown; hex?: unknown; computeMs?: unknown } | null;
+      const message = data as { id?: unknown; hex?: unknown; computeMs?: unknown; equal?: unknown; compareMs?: unknown } | null;
       const job = slot.job;
       if (!job || message?.id !== job.id || typeof message.hex !== 'string'
         || !/^[a-f0-9]{64}$/.test(message.hex) || typeof message.computeMs !== 'number'
-        || !Number.isFinite(message.computeMs) || message.computeMs < 0) { close(); return; }
+        || !Number.isFinite(message.computeMs) || message.computeMs < 0
+        || (job.copy && (typeof message.equal !== 'boolean' || typeof message.compareMs !== 'number'
+          || !Number.isFinite(message.compareMs) || message.compareMs < 0))) { close(); return; }
       clearTimeout(slot.timer); slot.job = undefined;
-      job.resolve({ hex: message.hex, computeMs: message.computeMs, backend: 'worker' });
+      job.resolve({ hex: message.hex, computeMs: message.computeMs, backend: 'worker',
+        equal: message.equal === true, compareMs: typeof message.compareMs === 'number' ? message.compareMs : 0 });
       drain();
     };
   }
+  const submit = (buffer: ArrayBuffer, copy?: ArrayBuffer): Promise<ExactResult> => {
+    if (failure) return Promise.reject(failure);
+    return new Promise<ExactResult>((resolve, reject) => {
+      queue.push({ id: ++nextId, buffer, copy, resolve, reject }); drain();
+    });
+  };
   return {
-    digest(buffer) {
-      if (failure) return Promise.reject(failure);
-      return new Promise<HashResult>((resolve, reject) => {
-        queue.push({ id: ++nextId, buffer, resolve, reject }); drain();
-      });
-    },
+    digest: buffer => submit(buffer),
+    ...(slots.every(slot => slot.exact) ? { compareExact: (keeper: ArrayBuffer, copy: ArrayBuffer) => submit(keeper, copy) } : {}),
     dispose() { close(new Error('内容校验已结束，请重新扫描。')); },
   };
 }

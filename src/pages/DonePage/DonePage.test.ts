@@ -31,3 +31,19 @@ it('does not invent failures for a simulation or after a refresh', () => {
   expect(render()).not.toContain('性能自检（不操作文件）');
   summary = null; expect(render()).toContain('暂无清理结果');
 });
+it('distinguishes full SHA checks from complete copy byte comparisons', () => {
+  summary = { mode: 'permanent', source: 'scan', cleanedCount: 195, cleanedBytes: 1234,
+    cleanedGroups: 13, remainingGroups: 0, metrics: {
+      elapsedMs: 1000, authorizationMs: 0, permissionMs: 0, metadataMs: 0, readMs: 0,
+      hashMs: 500, deleteMs: 0, verifiedFiles: 390, verifiedBytes: 2468, deleteCalls: 195,
+      peakChecks: 4, peakDeletes: 4, peakInputBytes: 48 * 1024 * 1024,
+      workerHashFiles: 195, mainHashFiles: 0, hashComputeMs: 400, byteComparedFiles: 195, byteCompareMs: 100,
+    } };
+  const dom = new JSDOM(render());
+  const values = new Map([...dom.window.document.querySelectorAll('dt')].map(dt => [dt.textContent, dt.nextElementSibling?.textContent]));
+  expect(values.get('完整校验次数')).toContain('390');
+  expect(values.get('完整指纹计算')).toBe('195 次');
+  expect(values.get('副本完整字节比较')).toBe('195 次');
+  expect(values.get('字节比较累计用时')).toBe('0.10 秒');
+  dom.window.close();
+});

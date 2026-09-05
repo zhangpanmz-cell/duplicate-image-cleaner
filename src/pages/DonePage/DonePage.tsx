@@ -143,7 +143,12 @@ export default function DonePage() {
           <div><dt>累计校验数据</dt><dd className="text-foreground">{formatBytes(summary.metrics.verifiedBytes)}</dd></div>
           <div><dt>校验方式</dt><dd className="text-foreground">{summary.metrics.workerHashFiles
             ? summary.metrics.mainHashFiles ? '独立线程 + 兼容模式' : '独立线程校验' : '主线程兼容模式'}</dd></div>
-          {summary.metrics.hashComputeMs !== undefined && <div><dt>计算调用累计用时</dt><dd className="text-foreground">{(summary.metrics.hashComputeMs / 1000).toFixed(2)} 秒</dd></div>}
+          {summary.metrics.hashComputeMs !== undefined && <div><dt>指纹计算累计用时</dt><dd className="text-foreground">{(summary.metrics.hashComputeMs / 1000).toFixed(2)} 秒</dd></div>}
+          {summary.metrics.byteComparedFiles !== undefined && <>
+            <div><dt>完整指纹计算</dt><dd className="text-foreground">{formatCount((summary.metrics.workerHashFiles ?? 0) + (summary.metrics.mainHashFiles ?? 0))} 次</dd></div>
+            <div><dt>副本完整字节比较</dt><dd className="text-foreground">{formatCount(summary.metrics.byteComparedFiles)} 次</dd></div>
+            <div><dt>字节比较累计用时</dt><dd className="text-foreground">{((summary.metrics.byteCompareMs ?? 0) / 1000).toFixed(2)} 秒</dd></div>
+          </>}
         </dl>
         <p className="mt-3 text-xs text-muted-foreground">
           分项为各调用累计耗时，并行操作有重叠，不能相加当作实际用时。“内容校验”还包含线程通信和等待；计算调用用时不等于纯 CPU 用时。仅本次页面内显示，不保存或上传。

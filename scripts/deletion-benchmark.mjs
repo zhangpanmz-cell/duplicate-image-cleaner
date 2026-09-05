@@ -16,6 +16,7 @@ for (const scenario of [
     let metrics;
     const result = await executeDeletion(f.access, plan, { cancelled: false }, undefined, {
       groupConcurrency: parallel ? 4 : 1, verificationConcurrency: parallel ? 4 : 1,
+      exactVerification: 'hash', // Keep this older scheduling-only baseline unchanged.
       onMetrics: (value) => { metrics = value; },
     });
     if (result.some((item) => item.status !== 'deleted')) throw new Error('Synthetic benchmark failed');

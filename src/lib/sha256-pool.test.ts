@@ -12,13 +12,14 @@ class TestWorker implements HashWorkerPort {
   received = 0;
   busy = false;
   constructor(ready = true) {
-    if (ready) setTimeout(() => this.onmessage?.({ data: { type: 'ready', hex: EMPTY_SHA256 } }), 0);
+    if (ready) setTimeout(() => this.onmessage?.({ data: { type: 'ready', hex: EMPTY_SHA256, exact: true } }), 0);
   }
-  postMessage(message: { id: number; buffer: ArrayBuffer }, transfer: ArrayBuffer[]) {
+  postMessage(message: { id: number; buffer: ArrayBuffer; copy?: ArrayBuffer }, transfer: ArrayBuffer[]) {
     expect(this.busy).toBe(false); this.busy = true; this.received++;
     const copy = structuredClone(message, { transfer });
     setTimeout(async () => {
-      const result = await nativeHashService().digest(copy.buffer);
+      const result = copy.copy ? await nativeHashService().compareExact!(copy.buffer, copy.copy)
+        : await nativeHashService().digest(copy.buffer);
       this.busy = false;
       if (!this.terminated) this.onmessage?.({ data: { id: copy.id, ...result } });
     }, 5);
@@ -28,6 +29,41 @@ class TestWorker implements HashWorkerPort {
 afterEach(() => { vi.unstubAllGlobals(); vi.doUnmock('./sha256-browser'); });
 
 describe('fresh full SHA-256 in a task-local worker pool', () => {
+  it('transfers both exact-pair buffers, hashes the keeper and compares all copy bytes', async () => {
+    const pool = await createHashPool(() => new TestWorker(), 2);
+    try {
+      const keeper = new TextEncoder().encode('abc').buffer, copy = keeper.slice(0);
+      const equal = await pool.compareExact!(keeper, copy);
+      expect(equal).toMatchObject({ equal: true, backend: 'worker', hex: 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad' });
+      expect(keeper.byteLength).toBe(0); expect(copy.byteLength).toBe(0);
+      expect((await pool.compareExact!(new ArrayBuffer(5), new Uint8Array([0, 0, 0, 0, 1]).buffer)).equal).toBe(false);
+    } finally { pool.dispose(); }
+  });
+  it.each(['missing-equality', 'nonboolean-equality', 'bad-timing', 'timeout', 'error'])(
+    'fails exact pairs closed on %s, settling the entire queue', async reason => {
+      const ports: TestWorker[] = [];
+      const pool = await createHashPool(() => {
+        const port = new TestWorker(); ports.push(port); port.postMessage = () => { port.received++; }; return port;
+      }, 2, 1000, 15);
+      const jobs = Promise.allSettled(Array.from({ length: 6 }, () => pool.compareExact!(new ArrayBuffer(5), new ArrayBuffer(5))));
+      if (reason === 'error') ports[0].onerror?.({ preventDefault() {} });
+      else if (reason !== 'timeout') ports[0].onmessage?.({ data: {
+        id: 1, hex: EMPTY_SHA256, computeMs: 1, compareMs: reason === 'bad-timing' ? NaN : 1,
+        ...(reason === 'missing-equality' ? {} : { equal: reason === 'nonboolean-equality' ? 'true' : true }),
+      } });
+      expect((await jobs).every(job => job.status === 'rejected')).toBe(true);
+      expect(ports.every(p => p.terminated)).toBe(true);
+      expect(ports.reduce((sum, p) => sum + p.received, 0)).toBe(2);
+    },
+  );
+  it('does not send pairs to legacy or diagnostic-only workers', async () => {
+    const pool = await createHashPool(() => {
+      const port = new TestWorker(false);
+      setTimeout(() => port.onmessage?.({ data: { type: 'ready', hex: EMPTY_SHA256 } }), 0);
+      return port;
+    });
+    expect(pool.compareExact).toBeUndefined(); pool.dispose();
+  });
   it('matches known vectors, transfers input buffers, bounds workers and preserves request identity', async () => {
     const ports: TestWorker[] = [];
     const pool = await createHashPool(() => { const p = new TestWorker(); ports.push(p); return p; }, 99);
