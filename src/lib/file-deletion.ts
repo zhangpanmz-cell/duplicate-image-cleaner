@@ -1,4 +1,5 @@
 import type { ISimilarFileEntry, ISimilarGroup } from '@/data/similarity';
+import { nativeHashService, type HashService } from './sha256-pool.ts';
 
 /** Browser File System Access contracts. Handles stay in this tab, never in the cache. */
 export interface LocalFileHandle {
@@ -47,11 +48,14 @@ export interface DeletionMetrics {
   metadataMs: number; readMs: number; hashMs: number; deleteMs: number;
   verifiedFiles: number; verifiedBytes: number; deleteCalls: number;
   peakChecks: number; peakDeletes: number; peakInputBytes: number;
+  workerHashFiles?: number; mainHashFiles?: number; hashComputeMs?: number;
 }
 export interface DeletionOptions {
   groupConcurrency?: number;
   verificationConcurrency?: number;
   maxInputBytes?: number;
+  /** Diagnostic baseline only; both modes always hash the complete fresh file. */
+  hashExecution?: 'auto' | 'main';
   onMetrics?: (metrics: DeletionMetrics) => void;
 }
 export interface DeletionPlan {
@@ -129,7 +133,7 @@ class DeletionStopped extends Error {}
 
 async function verifiedParent(
   access: LiveDirectoryAccess, file: ISimilarFileEntry, measure: Measure,
-  checkRunning: () => void, metrics: DeletionMetrics,
+  checkRunning: () => void, metrics: DeletionMetrics, hasher: HashService,
 ) {
   const target = access.targets.get(file.id);
   if (!target) throw new Error('原文件授权失效，请重新扫描。');
@@ -157,10 +161,12 @@ async function verifiedParent(
   });
   const buffer = await measure('readMs', () => fresh.arrayBuffer());
   checkRunning();
-  const digest = await measure('hashMs', () => crypto.subtle.digest('SHA-256', buffer));
+  const digest = await measure('hashMs', () => hasher.digest(buffer));
   checkRunning();
-  const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
-  if (hash !== target.fingerprint) {
+  metrics.hashComputeMs! += digest.computeMs;
+  if (digest.backend === 'worker') metrics.workerHashFiles! += 1;
+  else metrics.mainHashFiles! += 1;
+  if (digest.hex !== target.fingerprint) {
     throw new Error('文件内容或修改时间已变化，未删除；请重新扫描。');
   }
   metrics.verifiedFiles += 1;
@@ -193,10 +199,18 @@ export async function executeDeletion(
   const budget = bounded(options.maxInputBytes, 64 * 1024 * 1024, 64 * 1024 * 1024);
   const limit = verificationLimiter(verifyConcurrency, budget);
   const started = performance.now();
+  // Browser-only chunk keeps Node safety tests/benchmarks on native WebCrypto.
+  // Failed module/worker startup falls back to the same full native calculation.
+  let hasher = nativeHashService();
+  if (options.hashExecution !== 'main' && typeof Worker !== 'undefined') {
+    try { hasher = await (await import('./sha256-browser')).createBrowserHashService(); }
+    catch { /* Unsupported worker: retain complete main-thread verification. */ }
+  }
   const metrics: DeletionMetrics = {
     elapsedMs: 0, authorizationMs: 0, permissionMs: 0, metadataMs: 0, readMs: 0,
     hashMs: 0, deleteMs: 0, verifiedFiles: 0, verifiedBytes: 0, deleteCalls: 0,
     peakChecks: 0, peakDeletes: 0, peakInputBytes: 0,
+    workerHashFiles: 0, mainHashFiles: 0, hashComputeMs: 0,
   };
   const results = new Map<string, DeletionItemResult>();
   let activeChecks = 0, activeDeletes = 0, inputBytes = 0;
@@ -219,7 +233,7 @@ export async function executeDeletion(
     metrics.peakInputBytes = Math.max(metrics.peakInputBytes, inputBytes);
     try {
       report(file.relativePath);
-      return await verifiedParent(access, file, measure, checkRunning, metrics);
+      return await verifiedParent(access, file, measure, checkRunning, metrics, hasher);
     } catch (error) { if (denied(error)) stop = true; throw error; }
     finally { activeChecks -= 1; inputBytes -= size; report(file.relativePath); }
   });
@@ -287,6 +301,7 @@ export async function executeDeletion(
   });
   // Never return while a sibling worker could still remove another file.
   const settled = await Promise.allSettled(workers);
+  hasher.dispose();
   const fatal = settled.find((worker) => worker.status === 'rejected');
   if (fatal?.status === 'rejected') throw fatal.reason;
   metrics.elapsedMs = performance.now() - started;

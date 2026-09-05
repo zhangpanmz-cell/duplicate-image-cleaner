@@ -71,13 +71,17 @@ describe('仅内存会话界面', () => {
       cleanedBytes: 1024, cleanedGroups: 125, remainingGroups: 0,
       metrics: { elapsedMs: 8200, authorizationMs: 200, permissionMs: 500, metadataMs: 10000,
         readMs: 30, hashMs: 100, deleteMs: 2000, verifiedFiles: 500, verifiedBytes: 1024,
-        deleteCalls: 250, peakChecks: 4, peakDeletes: 4, peakInputBytes: 1024 },
+        deleteCalls: 250, peakChecks: 4, peakDeletes: 4, peakInputBytes: 1024,
+        workerHashFiles: 500, mainHashFiles: 0, hashComputeMs: 85 },
     } });
     const markup = renderToStaticMarkup(createElement(MemoryRouter, null, createElement(DonePage)));
     expect(markup).toContain('本次用时 8.2 秒（含等待授权）');
     expect(markup).toContain('查看耗时明细');
     expect(markup).toContain('系统删除');
     expect(markup).toContain('不能相加当作实际用时');
+    expect(markup).toContain('独立线程校验');
+    expect(markup).toContain('累计校验数据');
+    expect(markup).toContain('500 次（含保留文件重查）');
     expect(markup).toContain('不保存或上传');
   });
 });

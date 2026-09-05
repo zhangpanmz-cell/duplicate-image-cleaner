@@ -40,6 +40,35 @@
 - 使用 Node.js 24 运行 `node scripts/deletion-benchmark.mjs` 可比较串行基线和有限并行。基准只删除内存 Map 中的合成条目，不操作任何磁盘照片；每个文件系统调用人为增加 2ms 延迟，不能当作客户设备实测或速度保证。
 - 新增测试覆盖跨组并行上限、同组完整重查、保留项同大小同修改时间变更、权限撤销/取消的全局停止、等候在途操作、输入预算、完成顺序稳定和聚合计时。
 
+### 内容校验线程（2026-09-05）
+
+用户复测的 235 张 / 1.5 GB 操作耗时 27.9 秒，其中内容校验累计 89.30 秒，系统删除累计 2.10 秒。这定位到校验调用等待，而非证明操作系统删除慢；累计时间包含并发重叠，不能直接相减来预测新版本用时。
+
+SHA-256 仍用原生 WebCrypto，不改变算法或减少校验。现在由最多 4 个任务内 Worker 执行，使用 transferable ArrayBuffer 避免跨线程额外拷贝；每个 Worker 一次只处理一个完整文件，仍受原有 4 路 / 64 MiB 输入预算控制。Worker 没有文件系统句柄，不能删除文件。仅变更删除前的校验执行位置，扫描算法不变。
+
+Worker 使用 Vite 的 inline 打包，避免妙搭 CDN 资源跨来源启动 Worker 失败。启动时以空输入的已知 SHA-256 自检；创建、加载或自检失败（2 秒启动超时）时，在传递任何照片数据前回退主线程完整计算。已转移数据后的异常、错误消息或 120 秒任务超时会使校验失败，不能批准删除，也不拿分离后的缓冲区重试。结束或故障后销毁 Worker，所有结果仍要通过原有指纹比较及停止检查。
+
+完成页增加完整校验次数、累计校验数据（含保留项反复重查）、独立线程/兼容模式，以及计算调用累计用时。“内容校验”包含线程通信与等待，计算调用计时也不是纯 CPU 采样。不保存或上传任何性能信息。
+
+浏览器基准（纯本地开发页面，不进入应用发布入口）：
+
+```sh
+npx vite build --config tests/hash-benchmark.config.ts
+npx vite preview --config tests/hash-benchmark.config.ts --host 127.0.0.1 --port 5300
+# 浏览器访问 http://127.0.0.1:5300/tests/hash-benchmark.html 并点击运行
+```
+
+本机 Chromium 152、生产构建、交替顺序各测两次：
+
+| 场景 | 主线程 | 4 个 Worker | 不变的工作量 |
+| --- | --- | --- | --- |
+| 6 MiB 合成输入 × 128 | 0.339 / 0.330 秒 | 0.101 / 0.100 秒 | 768 MiB 完整 SHA-256，结果一致 |
+| 13 组 / 234 项内存模拟删除 | 1.433 / 1.388 秒 | 0.545 / 0.537 秒 | 468 次完整校验，共 2808 MiB；13 个保留项仍存在 |
+
+以上比较保持同样的组并发、校验并发和逐次重查，只改变计算位置。文件系统适配器是内存 Map，没有真实授权、磁盘 I/O、杀毒或同步软件开销；不能把约 2.6 倍的模拟流程提升当作客户设备保证。已有 Node 延迟基准测的是另一种瓶颈，不应混用。
+
+依据：[Chromium WebCrypto 实现](https://chromium.googlesource.com/chromium/src/+/HEAD/components/webcrypto/webcrypto_impl.cc) 中存在在调用线程执行 digest 的路径，故不能假设 Promise 即多核并行；具体路径取决于浏览器版本与配置。[MDN transferable objects](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Transferable_objects)、[Vite Worker 打包](https://vite.dev/guide/features.html#web-workers)。
+
 发布前后手动验收请仅使用专门复制的可丢弃测试目录：
 
 1. 放入两份完全相同图片、一对相似图片和一个无关文件，从目录入口扫描。

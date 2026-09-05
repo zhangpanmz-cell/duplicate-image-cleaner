@@ -9,6 +9,9 @@ export async function deletionFixture({
   const payload = new Uint8Array(bytes);
   const digest = await crypto.subtle.digest('SHA-256', payload);
   const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  // Blob is immutable; sharing backing bytes avoids allocating GBs of identical
+  // fixture payloads. Each verification still reads and hashes the entire File.
+  const blob = new Blob([payload]);
   const files = new Map<string, File>();
   const handles = new Map<string, LocalFileHandle>();
   const reads = new Map<string, number>();
@@ -41,7 +44,7 @@ export async function deletionFixture({
       totalSize: (selectedCount + retainedCount) * bytes, reclaimableSize: selectedCount * bytes };
     for (let index = 0; index < selectedCount + retainedCount; index += 1) {
       const name = `group-${groupIndex}-file-${index}.png`;
-      const file = new File([payload], name, { lastModified: 1234 });
+      const file = new File([blob], name, { lastModified: 1234 });
       files.set(name, file);
       const handle: LocalFileHandle = {
         kind: 'file', name,
