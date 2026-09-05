@@ -36,7 +36,24 @@ export interface DeletionItemResult {
   status: 'deleted' | 'failed' | 'cancelled';
   message: string;
 }
-export interface DeletionProgress { completed: number; total: number; currentFile: string }
+export interface DeletionProgress {
+  completed: number; total: number; currentFile: string;
+  phase?: 'authorizing' | 'working' | 'finished';
+  activeChecks?: number; activeDeletes?: number; verifiedBytes?: number; elapsedMs?: number;
+}
+/** Aggregate timings only: no paths, pictures, persistence or network reporting. */
+export interface DeletionMetrics {
+  elapsedMs: number; authorizationMs: number; permissionMs: number;
+  metadataMs: number; readMs: number; hashMs: number; deleteMs: number;
+  verifiedFiles: number; verifiedBytes: number; deleteCalls: number;
+  peakChecks: number; peakDeletes: number; peakInputBytes: number;
+}
+export interface DeletionOptions {
+  groupConcurrency?: number;
+  verificationConcurrency?: number;
+  maxInputBytes?: number;
+  onMetrics?: (metrics: DeletionMetrics) => void;
+}
 export interface DeletionPlan {
   groups: { retained: ISimilarFileEntry[]; selected: ISimilarFileEntry[]; level: ISimilarGroup['level'] }[];
   files: ISimilarFileEntry[];
@@ -87,23 +104,67 @@ export function makeDeletionPlan(
   return plan;
 }
 
-async function verifiedParent(access: LiveDirectoryAccess, file: ISimilarFileEntry) {
+/** FIFO bound on both open verification jobs and their input bytes. An oversized
+ * file runs alone; this bounds our inputs, not the browser's total heap/copies. */
+function verificationLimiter(concurrency: number, budget: number) {
+  let active = 0;
+  let bytes = 0;
+  const queue: { weight: number; ready: () => void }[] = [];
+  function drain() {
+    while (queue.length && active < concurrency) {
+      const next = queue[0];
+      if (active && bytes + next.weight > budget) break;
+      queue.shift(); active += 1; bytes += next.weight; next.ready();
+    }
+  }
+  return async <T>(weight: number, work: () => Promise<T>): Promise<T> => {
+    await new Promise<void>((ready) => { queue.push({ weight, ready }); drain(); });
+    try { return await work(); } finally { active -= 1; bytes -= weight; drain(); }
+  };
+}
+
+type TimedStage = 'permissionMs' | 'metadataMs' | 'readMs' | 'hashMs' | 'deleteMs';
+type Measure = <T>(stage: TimedStage, work: () => Promise<T>) => Promise<T>;
+class DeletionStopped extends Error {}
+
+async function verifiedParent(
+  access: LiveDirectoryAccess, file: ISimilarFileEntry, measure: Measure,
+  checkRunning: () => void, metrics: DeletionMetrics,
+) {
   const target = access.targets.get(file.id);
   if (!target) throw new Error('原文件授权失效，请重新扫描。');
-  const actualPath = await access.root.resolve(target.handle);
-  if (!actualPath || actualPath.join('/') !== target.path.join('/')) {
-    throw new Error('文件已移动或不在原扫描目录内，未删除。');
-  }
-  let parent = access.root;
-  for (const part of target.path.slice(0, -1)) parent = await parent.getDirectoryHandle(part);
-  // No create flags, no path-based fallback, no directory deletion.
-  const current = await parent.getFileHandle(file.name);
-  if (!await current.isSameEntry(target.handle)) throw new Error('原路径已被其他文件替换，未删除。');
-  const fresh = await current.getFile();
-  if (fresh.size !== target.size || fresh.lastModified !== target.lastModified
-    || await fingerprint(fresh) !== target.fingerprint) {
+  const { parent, fresh } = await measure('metadataMs', async () => {
+    const actualPath = await access.root.resolve(target.handle);
+    checkRunning();
+    if (!actualPath || actualPath.join('/') !== target.path.join('/')) {
+      throw new Error('文件已移动或不在原扫描目录内，未删除。');
+    }
+    let parent = access.root;
+    for (const part of target.path.slice(0, -1)) {
+      parent = await parent.getDirectoryHandle(part); checkRunning();
+    }
+    // Always resolve the original path and identity afresh. No cached parents.
+    const current = await parent.getFileHandle(file.name);
+    checkRunning();
+    if (!await current.isSameEntry(target.handle)) throw new Error('原路径已被其他文件替换，未删除。');
+    checkRunning();
+    const fresh = await current.getFile();
+    checkRunning();
+    if (fresh.size !== target.size || fresh.lastModified !== target.lastModified) {
+      throw new Error('文件内容或修改时间已变化，未删除；请重新扫描。');
+    }
+    return { parent, fresh };
+  });
+  const buffer = await measure('readMs', () => fresh.arrayBuffer());
+  checkRunning();
+  const digest = await measure('hashMs', () => crypto.subtle.digest('SHA-256', buffer));
+  checkRunning();
+  const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  if (hash !== target.fingerprint) {
     throw new Error('文件内容或修改时间已变化，未删除；请重新扫描。');
   }
+  metrics.verifiedFiles += 1;
+  metrics.verifiedBytes += fresh.size;
   return parent;
 }
 
@@ -115,20 +176,57 @@ function failureMessage(error: unknown): string {
   return error instanceof Error ? error.message : '删除失败，文件未删除。';
 }
 
-/** Caller obtains permission on a user gesture and journals the pending operation first.
- * Each retained file and target is re-read immediately before removal. The web API cannot
- * atomically compare-and-remove against external edits: UI asks users to close other editors.
+/** Independent, disjoint groups can overlap. Within a group every removal waits for
+ * fresh FULL verification of ALL keepers and its target, after the previous removal.
+ * No hash/metadata cache and no ahead-of-time batch approval. Web APIs still cannot
+ * atomically compare-and-remove against external edits; users must close other editors.
  */
 export async function executeDeletion(
   access: LiveDirectoryAccess, plan: DeletionPlan, token: { cancelled: boolean },
   onProgress: (progress: DeletionProgress) => void = () => undefined,
+  options: DeletionOptions = {},
 ): Promise<DeletionItemResult[]> {
-  const results: DeletionItemResult[] = [];
+  const bounded = (value: number | undefined, fallback: number, max: number) =>
+    Number.isFinite(value) ? Math.max(1, Math.min(max, Math.floor(value!))) : fallback;
+  const concurrency = bounded(options.groupConcurrency, 4, 4);
+  const verifyConcurrency = bounded(options.verificationConcurrency, 4, 4);
+  const budget = bounded(options.maxInputBytes, 64 * 1024 * 1024, 64 * 1024 * 1024);
+  const limit = verificationLimiter(verifyConcurrency, budget);
+  const started = performance.now();
+  const metrics: DeletionMetrics = {
+    elapsedMs: 0, authorizationMs: 0, permissionMs: 0, metadataMs: 0, readMs: 0,
+    hashMs: 0, deleteMs: 0, verifiedFiles: 0, verifiedBytes: 0, deleteCalls: 0,
+    peakChecks: 0, peakDeletes: 0, peakInputBytes: 0,
+  };
+  const results = new Map<string, DeletionItemResult>();
+  let activeChecks = 0, activeDeletes = 0, inputBytes = 0;
   let stop = false;
-  for (const group of plan.groups) {
+  const checkRunning = () => { if (token.cancelled || stop) throw new DeletionStopped(); };
+  const denied = (error: unknown) => error instanceof Error && ['NotAllowedError', 'SecurityError'].includes(error.name);
+  const measure: Measure = async (stage, work) => {
+    const start = performance.now();
+    try { return await work(); } finally { metrics[stage] += performance.now() - start; }
+  };
+  const report = (currentFile: string, phase: DeletionProgress['phase'] = 'working') => onProgress({
+    completed: results.size, total: plan.files.length, currentFile, phase,
+    activeChecks, activeDeletes, verifiedBytes: metrics.verifiedBytes, elapsedMs: performance.now() - started,
+  });
+  const verify = (file: ISimilarFileEntry) => limit(access.targets.get(file.id)?.size ?? 0, async () => {
+    checkRunning();
+    const size = access.targets.get(file.id)?.size ?? 0;
+    activeChecks += 1; inputBytes += size;
+    metrics.peakChecks = Math.max(metrics.peakChecks, activeChecks);
+    metrics.peakInputBytes = Math.max(metrics.peakInputBytes, inputBytes);
+    try {
+      report(file.relativePath);
+      return await verifiedParent(access, file, measure, checkRunning, metrics);
+    } catch (error) { if (denied(error)) stop = true; throw error; }
+    finally { activeChecks -= 1; inputBytes -= size; report(file.relativePath); }
+  });
+  async function processGroup(group: DeletionPlan['groups'][number]) {
     let groupError: string | null = null;
     for (const file of group.selected) {
-      onProgress({ completed: results.length, total: plan.files.length, currentFile: file.relativePath });
+      report(file.relativePath);
       const result: DeletionItemResult = {
         id: file.id, path: file.relativePath, size: file.size, status: 'failed', message: '',
       };
@@ -139,41 +237,63 @@ export async function executeDeletion(
         } else if (groupError) {
           result.message = groupError;
         } else {
-          if (await access.root.queryPermission({ mode: 'readwrite' }) !== 'granted') {
+          if (await measure('permissionMs', () => access.root.queryPermission({ mode: 'readwrite' })) !== 'granted') {
             stop = true;
             throw new Error('目录写入权限已撤销，已停止删除。');
           }
-          try {
-            for (const retained of group.retained) await verifiedParent(access, retained);
-            if (group.level === 'exact') {
-              const keeperHash = access.targets.get(group.retained[0].id)?.fingerprint;
-              if (access.targets.get(file.id)?.fingerprint !== keeperHash) {
-                throw new Error('副本与保留项不再完全一致，未删除。');
-              }
-            }
-          } catch (error) {
-            groupError = `保留项核验失败：${failureMessage(error)}`;
+          checkRunning();
+          // Settle every started check before deleting, reporting an error or leaving.
+          const checks = await Promise.allSettled([...group.retained, file].map(verify));
+          const keeperFailure = checks.slice(0, -1).find((check) => check.status === 'rejected');
+          if (keeperFailure?.status === 'rejected' && !(keeperFailure.reason instanceof DeletionStopped)) {
+            groupError = `保留项核验失败：${failureMessage(keeperFailure.reason)}`;
             throw new Error(groupError);
           }
-          const parent = await verifiedParent(access, file);
-          if (token.cancelled) {
-            result.status = 'cancelled';
-            result.message = '操作已停止，此文件未删除。';
-          } else {
-            await parent.removeEntry(file.name, { recursive: false });
+          const targetCheck = checks[checks.length - 1];
+          if (targetCheck.status === 'rejected' && !(targetCheck.reason instanceof DeletionStopped)) throw targetCheck.reason;
+          checkRunning();
+          if (keeperFailure || targetCheck.status !== 'fulfilled') throw new DeletionStopped();
+          if (group.level === 'exact' && access.targets.get(file.id)?.fingerprint
+            !== access.targets.get(group.retained[0].id)?.fingerprint) {
+            groupError = '副本与保留项不再完全一致，未删除。';
+            throw new Error(groupError);
+          }
+          activeDeletes += 1;
+          metrics.peakDeletes = Math.max(metrics.peakDeletes, activeDeletes);
+          try {
+            report(file.relativePath);
+            checkRunning();
+            metrics.deleteCalls += 1;
+            await measure('deleteMs', () => targetCheck.value.removeEntry(file.name, { recursive: false }));
             result.status = 'deleted';
             result.message = '已删除';
-          }
+          } finally { activeDeletes -= 1; }
         }
       } catch (error) {
-        result.message = failureMessage(error);
-        if (error instanceof Error && ['NotAllowedError', 'SecurityError'].includes(error.name)) stop = true;
+        if (error instanceof DeletionStopped) {
+          result.status = 'cancelled'; result.message = '操作已停止，此文件未删除。';
+        } else result.message = failureMessage(error);
+        if (denied(error)) stop = true;
       }
-      results.push(result);
-      onProgress({ completed: results.length, total: plan.files.length, currentFile: file.relativePath });
+      results.set(file.id, result);
+      report(file.relativePath);
     }
   }
-  return results;
+  let nextGroup = 0;
+  const workers = Array.from({ length: Math.min(concurrency, plan.groups.length) }, async () => {
+    try {
+      while (nextGroup < plan.groups.length) await processGroup(plan.groups[nextGroup++]);
+    } catch (error) { stop = true; throw error; }
+  });
+  // Never return while a sibling worker could still remove another file.
+  const settled = await Promise.allSettled(workers);
+  const fatal = settled.find((worker) => worker.status === 'rejected');
+  if (fatal?.status === 'rejected') throw fatal.reason;
+  metrics.elapsedMs = performance.now() - started;
+  report('', 'finished');
+  options.onMetrics?.({ ...metrics });
+  // Keep the confirmed manifest order even when independent groups finish out of order.
+  return plan.files.map((file) => results.get(file.id)!);
 }
 
 /** Failed/untouched selections stay visible; only successful removals count as deleted. */

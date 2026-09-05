@@ -13,7 +13,7 @@ import type { ICleanSummary } from '@/data/done-page';
 import type { ISimilarGroup } from '@/data/similarity';
 import {
   applyDeletionResults, executeDeletion, fingerprint, makeDeletionPlan,
-  type DeletionProgress, type LiveDirectoryAccess, type LocalDirectoryHandle,
+  type DeletionMetrics, type DeletionProgress, type LiveDirectoryAccess, type LocalDirectoryHandle,
 } from '@/lib/file-deletion';
 import {
   applyDeselectAllToScope,
@@ -343,13 +343,16 @@ export function ScanSessionProvider({ children }: { children: ReactNode }) {
     const token = { cancelled: false };
     deletionToken.current = token;
     setIsDeleting(true);
-    setDeletionProgress({ completed: 0, total: plan.files.length, currentFile: '等待目录写入授权…' });
+    setDeletionProgress({ completed: 0, total: plan.files.length, currentFile: '等待目录写入授权…', phase: 'authorizing' });
+    const operationStarted = performance.now();
+    let metrics: DeletionMetrics | undefined;
     let executionStarted = false;
     try {
       // Called directly on the confirmation click, before hashing/lock awaits.
       if (await access.root.requestPermission({ mode: 'readwrite' }) !== 'granted') {
         throw new Error('未获得目录写入权限，没有删除任何文件。');
       }
+      const authorizationMs = performance.now() - operationStarted;
       if (!navigator.locks) throw new Error('当前浏览器不支持安全删除锁，请使用最新版桌面 Chrome / Edge。');
       return await navigator.locks.request('duplicate-image-cleaner:permanent-delete', { ifAvailable: true }, async (lock) => {
         if (!lock) throw new Error('另一个页面正在删除文件，请等待完成后重新扫描。');
@@ -357,14 +360,23 @@ export function ScanSessionProvider({ children }: { children: ReactNode }) {
         // No durable journal or restoration. The memory token cancels on page exit,
         // and a new document must scan and explicitly authorize a new operation.
         executionStarted = true;
+        let lastProgressAt = 0, lastCompleted = -1;
         const results = await executeDeletion(access, plan, token, (progress) => {
-          if (deletionToken.current === token) setDeletionProgress(progress);
-        });
+          const now = performance.now();
+          // Coalesce intermediate check events; completion and final state are immediate.
+          if (deletionToken.current === token && (progress.completed !== lastCompleted
+            || progress.phase === 'finished' || now - lastProgressAt >= 100)) {
+            lastProgressAt = now; lastCompleted = progress.completed;
+            setDeletionProgress({ ...progress, elapsedMs: now - operationStarted });
+          }
+        }, { onMetrics: (value) => {
+          metrics = { ...value, authorizationMs, elapsedMs: performance.now() - operationStarted };
+        } });
         if (deletionToken.current !== token) return false;
         const computation = applyDeletionResults(originalGroups, results);
         const deleted = results.filter((item) => item.status === 'deleted');
         const summary: ICleanSummary = {
-          mode: 'permanent', source: 'scan', results,
+          mode: 'permanent', source: 'scan', results, metrics,
           cleanedCount: deleted.length, cleanedBytes: deleted.reduce((sum, item) => sum + item.size, 0),
           cleanedGroups: computation.cleanedGroups, remainingGroups: computation.remainingGroups.length,
         };

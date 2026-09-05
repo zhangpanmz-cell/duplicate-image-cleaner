@@ -5,6 +5,7 @@ export interface ICleanSummary {
   /** 示例数据可省略；实际操作由当前页面明确设置。 */
   mode?: 'simulation' | 'permanent';
   results?: import('@/lib/file-deletion').DeletionItemResult[];
+  metrics?: import('@/lib/file-deletion').DeletionMetrics;
   /** 成功清理的文件数 */
   cleanedCount: number;
   /** 已模拟释放的字节数 */

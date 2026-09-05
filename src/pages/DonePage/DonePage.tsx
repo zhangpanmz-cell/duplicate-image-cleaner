@@ -97,6 +97,9 @@ export default function DonePage() {
             ? '本次勾选的重复副本已模拟移入回收站'
             : '本轮没有勾选任何副本'}
         </p>
+        {real && summary.metrics && <p className="text-sm text-muted-foreground">
+          本次用时 {(summary.metrics.elapsedMs / 1000).toFixed(1)} 秒（含等待授权）
+        </p>}
       </div>
 
       <div className="grid gap-4 sm:grid-cols-3">
@@ -120,6 +123,25 @@ export default function DonePage() {
           );
         })}
       </div>
+
+      {real && summary.metrics && <details className="rounded-xl border bg-card p-4 text-sm">
+        <summary className="cursor-pointer font-medium">查看耗时明细</summary>
+        <dl className="mt-3 grid grid-cols-2 gap-2 text-muted-foreground">
+          {([
+            ['等待授权', summary.metrics.authorizationMs],
+            ['权限检查', summary.metrics.permissionMs],
+            ['路径与文件检查', summary.metrics.metadataMs],
+            ['读取内容', summary.metrics.readMs],
+            ['内容校验', summary.metrics.hashMs],
+            ['系统删除', summary.metrics.deleteMs],
+          ] as const).map(([label, ms]) => <div key={label}>
+            <dt>{label}</dt><dd className="text-foreground tabular-nums">{(ms / 1000).toFixed(2)} 秒</dd>
+          </div>)}
+        </dl>
+        <p className="mt-3 text-xs text-muted-foreground">
+          分项为各调用累计耗时，并行操作有重叠，不能相加当作实际用时。仅本次页面内显示，不保存或上传。
+        </p>
+      </details>}
 
       <Card className="bg-muted/40">
         <CardContent className="p-4 flex items-start gap-2.5">

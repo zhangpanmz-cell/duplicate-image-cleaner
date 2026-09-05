@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { useScanSession } from '@/hooks/useScanSession';
 import { createInitialProgress } from '@/lib/scan-engine';
 import SessionBoundary from './SessionBoundary';
+import DonePage from '@/pages/DonePage/DonePage';
 
 vi.mock('@/hooks/useScanSession', () => ({ useScanSession: vi.fn() }));
 
@@ -50,5 +51,33 @@ describe('仅内存会话界面', () => {
     expect(markup).toContain('部分文件可能已删除');
     expect(markup).toContain('不会自动重试');
     expect(markup).not.toContain('缓存');
+  });
+  it('分别显示等待授权和运行中的校验、删除数量', () => {
+    const waiting = render({ isDeleting: true, deletionProgress: {
+      completed: 0, total: 250, currentFile: '等待目录写入授权…', phase: 'authorizing',
+    } });
+    expect(waiting).toContain('等待目录写入授权');
+    const working = render({ isDeleting: true, deletionProgress: {
+      completed: 20, total: 250, currentFile: '照片/1.png', phase: 'working',
+      activeChecks: 4, activeDeletes: 2, verifiedBytes: 1024 * 1024,
+    } });
+    expect(working).toContain('校验中 4 个 · 删除中 2 个');
+    expect(working).toContain('已完整校验 1.0 MB 数据');
+    expect(working).toContain('文件处理进度');
+    expect(working).not.toContain('单个删除');
+  });
+  it('完成页只展示本次聚合计时，明确并发累计时间不能相加', () => {
+    render({ cleanSummary: { source: 'scan', mode: 'permanent', cleanedCount: 250,
+      cleanedBytes: 1024, cleanedGroups: 125, remainingGroups: 0,
+      metrics: { elapsedMs: 8200, authorizationMs: 200, permissionMs: 500, metadataMs: 10000,
+        readMs: 30, hashMs: 100, deleteMs: 2000, verifiedFiles: 500, verifiedBytes: 1024,
+        deleteCalls: 250, peakChecks: 4, peakDeletes: 4, peakInputBytes: 1024 },
+    } });
+    const markup = renderToStaticMarkup(createElement(MemoryRouter, null, createElement(DonePage)));
+    expect(markup).toContain('本次用时 8.2 秒（含等待授权）');
+    expect(markup).toContain('查看耗时明细');
+    expect(markup).toContain('系统删除');
+    expect(markup).toContain('不能相加当作实际用时');
+    expect(markup).toContain('不保存或上传');
   });
 });

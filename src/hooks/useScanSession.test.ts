@@ -94,6 +94,10 @@ it('requests permission on the click and counts only successful file deletions',
   expect(session.cleanSummary?.cleanedCount).toBe(1);
   expect(session.cleanSummary?.cleanedBytes).toBe(3);
   expect(session.cleanSummary?.mode).toBe('permanent');
+  expect(session.cleanSummary?.metrics?.deleteCalls).toBe(2);
+  expect(session.cleanSummary?.metrics?.verifiedFiles).toBe(4);
+  expect(session.cleanSummary?.metrics?.elapsedMs).toBeGreaterThanOrEqual(0);
+  expect(session.cleanSummary?.metrics?.authorizationMs).toBeGreaterThanOrEqual(0);
   expect(session.groups[0].files.map((file) => file.id)).toEqual(['0', '2']);
   expect(session.groups[0].files[1].selected).toBe(true);
   expect(storageAccess).not.toHaveBeenCalled();
