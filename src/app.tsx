@@ -5,6 +5,7 @@ import ScanningPage from "@/pages/ScanningPage/ScanningPage";
 import ResultsPage from "@/pages/ResultsPage/ResultsPage";
 import DonePage from "@/pages/DonePage/DonePage";
 import NotFoundPage from "@/pages/NotFoundPage/NotFoundPage";
+import DiagnosticsPage from "@/pages/DiagnosticsPage/DiagnosticsPage";
 
 export default function App() {
   return (
@@ -14,6 +15,7 @@ export default function App() {
         <Route path="scanning" element={<ScanningPage />} />
         <Route path="results" element={<ResultsPage />} />
         <Route path="done" element={<DonePage />} />
+        <Route path="diagnostics" element={<DiagnosticsPage />} />
       </Route>
       <Route path="*" element={<NotFoundPage />} />
     </Routes>

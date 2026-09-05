@@ -150,6 +150,13 @@ export default function DonePage() {
         </p>
       </details>}
 
+      {real && unsuccessful.length > 0 && <Card><CardContent className="p-5 space-y-3">
+        <h2 className="font-semibold text-destructive">未删除文件及原因</h2>
+        <ul className="max-h-64 overflow-y-auto divide-y text-sm">{unsuccessful.map(item => <li key={item.id} className="py-2 space-y-1">
+          <p className="break-all">{item.path}</p><p className="text-destructive">{item.message || '文件未删除，请重新扫描核对。'}</p>
+        </li>)}</ul>
+      </CardContent></Card>}
+
       <Card className="bg-muted/40">
         <CardContent className="p-4 flex items-start gap-2.5">
           <ShieldCheck className="size-4 text-primary shrink-0 mt-0.5" />
@@ -171,6 +178,7 @@ export default function DonePage() {
       </CardContent></Card>}
 
       <div className="flex flex-wrap justify-center gap-3">
+        {real && <Button variant="outline" onClick={() => navigate('/diagnostics')}>性能自检（不操作文件）</Button>}
         {summary.remainingGroups > 0 && (
           <Button variant="outline" onClick={handleBackToResults}>
             <ArrowLeft className="size-4" />

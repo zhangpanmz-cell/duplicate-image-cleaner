@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { Layout } from '@/components/Layout';
 import ResultsPage from '@/pages/ResultsPage/ResultsPage';
 import HomePage from './HomePage';
+import App from '@/app';
 
 vi.mock('@lark-apaas/client-toolkit-lite', () => ({
   logger: { error: vi.fn() },
@@ -27,6 +28,14 @@ function renderPage(pathname = '/', basename = '/') {
 }
 
 describe('首页和结果页文案精简', () => {
+  it.each(['/', '/app/app_17df5ghxcy7'])('真实路由在 %s 基路径可直接打开非破坏性自检', basename => {
+    const markup = renderToStaticMarkup(createElement(MemoryRouter, { basename,
+      initialEntries: [(basename === '/' ? '' : basename) + '/diagnostics'],
+    }, createElement(App)));
+    expect(markup).toContain('性能自检');
+    expect(markup).toContain('开始自检');
+    expect(markup).not.toContain('type="file"');
+  });
   it.each(['/', '/app/app_17df5ghxcy7'])('在 %s 基路径下使用新副标题并移除指定文案', (basename) => {
     const markup = renderPage('/', basename);
     expect(markup).toContain('找出磁盘中内容相同或相似图片');
