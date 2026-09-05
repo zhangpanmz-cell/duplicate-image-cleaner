@@ -1,0 +1,12 @@
+run = ["npm", "run", "dev"]
+lint = ["npm", "run", "lint"]
+hidden = [".config", ".git", "scripts", "node_modules", "dist", ".spark", ".agent", ".agents", ".claude", "tmp", ".spark_project", ".playwright-cli"]
+
+[deployment]
+build = ["npm", "run", "build"]
+
+[files]
+[files.restrict]
+pathPatterns = ["package.json", ".spark_project", ".spark/meta.json", ".gitignore"]
+[files.hidden]
+pathPatterns = [".config", ".git", "scripts", "node_modules", "dist", ".spark", ".agent", ".agents", ".claude", "tmp", ".spark_project", ".playwright-cli"]
